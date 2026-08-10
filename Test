@@ -1,0 +1,84 @@
+Create a modern desktop Canvas Power App called “Portfolio & Governance Dashboard” for a pharmaceutical portfolio management team.
+Use a clean enterprise layout with a white/light-gray background, a muted coral/red top header, blue accent for the selected navigation item, dark gray text, subtle borders, and minimal shadows. The design should look professional, accessible, and suitable for Microsoft Power Apps.
+Build the application shell first. Do not create dashboards, charts, KPIs, SharePoint lists, or data connections yet. I only want the navigation and blank screen layouts at this stage.
+Global layout
+Create a responsive desktop layout approximately 1366 × 768 with:
+A top header approximately 60–70 px high
+A left navigation panel approximately 260–280 px wide
+A large main content area on the right
+Top header
+Use a muted coral/red header.
+On the left display:
+Menu/hamburger icon
+Application title: Portfolio & Governance Dashboard
+Small subtitle: Pharma Portfolio Management
+On the right display:
+Search box
+Notification icon
+User profile/avatar
+Left navigation
+Divide the navigation into two expandable sections.
+PORTFOLIO
+L&G
+VO
+LD
+Escalations
+Delistings
+GOVERNANCE
+Quality Compliance
+BB Dashboard Risk BCO
+BB Dashboard Project Assignment
+Use simple Fluent-style icons beside each menu item.
+The currently selected item should have:
+Light blue background
+Blue vertical line on the left
+Blue icon/text
+Slightly bold text
+Add a Collapse option at the bottom of the navigation.
+Screens
+Create one separate screen for every navigation item:
+scrLaunchGrow
+scrValueOptimizer
+scrLD
+scrEscalations
+scrDelistings
+scrQualityCompliance
+scrBBRiskBCO
+scrBBProjectAssignment
+Use the same reusable header and left-navigation component on every screen.
+Main content layout
+Keep every page mostly blank for now.
+At the top of the content area show:
+Welcome
+Then show the selected page name as a large title.
+Examples:
+L&G – Launch & Grow
+VO – Value Optimizer
+LD
+Escalations
+Delistings
+Quality Compliance
+BB Dashboard Risk BCO
+BB Dashboard Project Assignment
+Under the title add a short descriptive subtitle.
+Example for L&G: “Manage monthly updates, status, risks and key activities for Launch & Grow products.”
+Below the page header create one large blank white content container with a subtle dashed/light-gray border. This area will later contain forms, galleries, tables and actions.
+In the center of the blank area show a simple placeholder icon and:
+“This section is ready for your content”
+With smaller text:
+“Forms, galleries, tables and actions will appear here.”
+Navigation behavior
+When a user selects a menu item:
+Navigate to the corresponding screen
+Highlight the selected navigation item
+Preserve the same overall page layout
+Design guidance
+Use:
+Segoe UI or Power Apps default modern font
+Coral/red header approximately #D95C59
+Primary blue approximately #2563EB
+White background
+Very light gray content backgrounds
+Dark text approximately #1F2937
+Gray secondary text approximately #6B7280
+Use modern Power Apps controls and responsive containers where possible. Keep the application simple and uncluttered because the data-entry forms will be added later.
