@@ -1,0 +1,120 @@
+----------------------------------------------------
+        # Get local files
+        # ----------------------------------------------------
+
+        files = get_local_files()
+
+        results = []
+
+        # ----------------------------------------------------
+        # Process each datasource
+        # ----------------------------------------------------
+
+        for file_path in files:
+
+            try:
+
+                section(
+                    f"PROCESSING "
+                    f"{os.path.basename(file_path)}"
+                )
+
+                # 1. Publish + Private Network
+                (
+                    datasource_name,
+                    datasource_id
+                ) = publish_datasource(
+                    token,
+                    site_id,
+                    project_id,
+                    file_path
+                )
+
+                # 2. Connections
+                connections = get_connections(
+                    token,
+                    site_id,
+                    datasource_id
+                )
+
+                # 3. Snowflake connections
+                snowflake_connections = (
+                    find_snowflake_connections(
+                        connections
+                    )
+                )
+
+                # 4. Embed credential/user
+                for connection in (
+                    snowflake_connections
+                ):
+
+                    embed_keypair_user(
+                        token,
+                        site_id,
+                        datasource_id,
+                        connection
+                    )
+
+                # 5. Verify
+                verified = verify_connection(
+                    token,
+                    site_id,
+                    datasource_id
+                )
+
+                results.append({
+                    "name": datasource_name,
+                    "id": datasource_id,
+                    "success": verified
+                })
+
+            except Exception as exc:
+
+                print()
+                print(
+                    "FAILED:",
+                    os.path.basename(file_path)
+                )
+
+                print(
+                    type(exc).__name__,
+                    ":",
+                    str(exc)
+                )
+
+                results.append({
+                    "name":
+                        os.path.basename(file_path),
+                    "id": None,
+                    "success": False
+                })
+
+        # ----------------------------------------------------
+        # Summary
+        # ----------------------------------------------------
+
+        section("FINAL SUMMARY")
+
+        for item in results:
+
+            status = (
+                "SUCCESS"
+                if item["success"]
+                else "FAILED"
+            )
+
+            print(
+                f"{status:10} | "
+                f"{item['name']} | "
+                f"{item['id']}"
+            )
+
+    finally:
+
+        if token:
+            sign_out(token)
+
+
+if __name__ == "__main__":
+    main()
