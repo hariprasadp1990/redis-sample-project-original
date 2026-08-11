@@ -1,0 +1,976 @@
+import os
+import sys
+import uuid
+import getpass
+import requests
+import urllib3
+import xml.etree.ElementTree as ET
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Tableau Cloud
+CLOUD_URL = "https://abc.cloud.com"
+CLOUD_SITE = "abc"
+
+# Tableau REST API
+REST_API = "3.29"
+
+# PAT
+PAT_NAME = "SA-Cloud"
+
+# Recommended:
+# PowerShell:
+# $env:TABLEAU_PAT_SECRET="your_pat_secret"
+PAT_SECRET = os.getenv("TABLEAU_PAT_SECRET")
+
+# ------------------------------------------------------------
+# LOCAL FILE / FOLDER
+# ------------------------------------------------------------
+
+# OPTION 1: Single file
+LOCAL_PATH = r"C:\Tableau\Migration\MyDatasource.tdsx"
+
+# OPTION 2: Folder
+# LOCAL_PATH = r"C:\Tableau\Migration"
+
+# ------------------------------------------------------------
+# TARGET TABLEAU PROJECT
+# ------------------------------------------------------------
+
+PROJECT_NAME = "My Project"
+
+# ------------------------------------------------------------
+# SNOWFLAKE CONNECTION
+# ------------------------------------------------------------
+
+SNOWFLAKE_SERVER = "abc.snowflake.com"
+
+# This is the saved key-pair username in Tableau Cloud
+SNOWFLAKE_USERNAME = "abc-connect"
+
+# ------------------------------------------------------------
+# PUBLISH OPTIONS
+# ------------------------------------------------------------
+
+OVERWRITE = True
+
+# True = Private Network / Bridge
+USE_PRIVATE_NETWORK = True
+
+# Normally True.
+# Set False only if your corporate SSL environment requires it.
+VERIFY_SSL = False
+
+
+# ============================================================
+# SETUP
+# ============================================================
+
+if not VERIFY_SSL:
+    urllib3.disable_warnings(
+        urllib3.exceptions.InsecureRequestWarning
+    )
+
+
+def section(title):
+    print()
+    print("=" * 90)
+    print(title)
+    print("=" * 90)
+
+
+def local_name(tag):
+    return tag.split("}")[-1]
+
+
+def find_first(root, name):
+    for element in root.iter():
+        if local_name(element.tag) == name:
+            return element
+    return None
+
+
+def find_all(root, name):
+    result = []
+
+    for element in root.iter():
+        if local_name(element.tag) == name:
+            result.append(element)
+
+    return result
+
+
+# ============================================================
+# 1. SIGN IN
+# ============================================================
+
+def sign_in():
+
+    global PAT_SECRET
+
+    section("STEP 1 - SIGN IN")
+
+    if not PAT_SECRET:
+        PAT_SECRET = getpass.getpass(
+            "Enter Tableau PAT Secret: "
+        )
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}/auth/signin"
+    )
+
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<tsRequest>
+    <credentials
+        personalAccessTokenName="{PAT_NAME}"
+        personalAccessTokenSecret="{PAT_SECRET}">
+        <site contentUrl="{CLOUD_SITE}" />
+    </credentials>
+</tsRequest>
+"""
+
+    headers = {
+        "Content-Type": "application/xml",
+        "Accept": "application/xml"
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        data=payload.encode("utf-8"),
+        timeout=60,
+        verify=VERIFY_SSL
+    )
+
+    print("HTTP Status:", response.status_code)
+
+    if not response.ok:
+        print(response.text)
+        raise RuntimeError("Tableau sign-in failed")
+
+    root = ET.fromstring(response.text)
+
+    credentials = find_first(
+        root,
+        "credentials"
+    )
+
+    if credentials is None:
+        raise RuntimeError(
+            "Credentials not returned by Tableau"
+        )
+
+    token = credentials.attrib.get("token")
+
+    site = find_first(
+        credentials,
+        "site"
+    )
+
+    site_id = site.attrib.get("id")
+
+    print("Sign in successful")
+    print("Site LUID:", site_id)
+
+    return token, site_id
+
+
+# ============================================================
+# 2. FIND PROJECT LUID
+# ============================================================
+
+def get_project_id(token, site_id):
+
+    section("STEP 2 - FIND PROJECT")
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}"
+        + f"/sites/{site_id}/projects"
+        + "?pageSize=1000"
+    )
+
+    headers = {
+        "X-Tableau-Auth": token,
+        "Accept": "application/xml"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    if not response.ok:
+        print(response.text)
+        raise RuntimeError(
+            "Unable to retrieve projects"
+        )
+
+    root = ET.fromstring(response.text)
+
+    matches = []
+
+    for project in find_all(root, "project"):
+
+        project_name = project.attrib.get(
+            "name",
+            ""
+        )
+
+        if (
+            project_name.strip().lower()
+            == PROJECT_NAME.strip().lower()
+        ):
+            matches.append(project)
+
+    if len(matches) == 0:
+
+        raise RuntimeError(
+            f"Project not found: {PROJECT_NAME}"
+        )
+
+    if len(matches) > 1:
+
+        print(
+            "WARNING: Multiple projects with same "
+            "name were found."
+        )
+
+        for project in matches:
+            print(
+                project.attrib.get("name"),
+                project.attrib.get("id")
+            )
+
+        raise RuntimeError(
+            "Use a unique project name or hardcode "
+            "the required Project LUID."
+        )
+
+    project_id = matches[0].attrib["id"]
+
+    print("Project Name:", PROJECT_NAME)
+    print("Project LUID:", project_id)
+
+    return project_id
+
+
+# ============================================================
+# 3. GET LOCAL TABLEAU FILES
+# ============================================================
+
+def get_local_files():
+
+    section("STEP 3 - FIND LOCAL FILES")
+
+    supported_extensions = (
+        ".tds",
+        ".tdsx"
+    )
+
+    if os.path.isfile(LOCAL_PATH):
+
+        if not LOCAL_PATH.lower().endswith(
+            supported_extensions
+        ):
+            raise RuntimeError(
+                "Only .tds and .tdsx are supported "
+                "by this script."
+            )
+
+        files = [LOCAL_PATH]
+
+    elif os.path.isdir(LOCAL_PATH):
+
+        files = []
+
+        for filename in os.listdir(LOCAL_PATH):
+
+            full_path = os.path.join(
+                LOCAL_PATH,
+                filename
+            )
+
+            if (
+                os.path.isfile(full_path)
+                and
+                filename.lower().endswith(
+                    supported_extensions
+                )
+            ):
+                files.append(full_path)
+
+    else:
+
+        raise RuntimeError(
+            f"Local path not found: {LOCAL_PATH}"
+        )
+
+    if not files:
+        raise RuntimeError(
+            "No .tds or .tdsx files found."
+        )
+
+    print("Files found:", len(files))
+
+    for file_path in files:
+        print(" -", file_path)
+
+    return files
+
+
+# ============================================================
+# 4. PUBLISH DATASOURCE
+#    + SET PRIVATE NETWORK
+# ============================================================
+
+def publish_datasource(
+        token,
+        site_id,
+        project_id,
+        file_path
+):
+
+    section(
+        f"STEP 4 - PUBLISH {os.path.basename(file_path)}"
+    )
+
+    datasource_name = os.path.splitext(
+        os.path.basename(file_path)
+    )[0]
+
+    file_size = os.path.getsize(file_path)
+
+    # Single-request Tableau publish limit
+    max_size = 64 * 1024 * 1024
+
+    if file_size > max_size:
+
+        raise RuntimeError(
+            f"{datasource_name} is larger than 64 MB. "
+            "Use Tableau chunked upload for this file."
+        )
+
+    overwrite = (
+        "true"
+        if OVERWRITE
+        else "false"
+    )
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}"
+        + f"/sites/{site_id}/datasources"
+        + f"?overwrite={overwrite}"
+    )
+
+    # --------------------------------------------------------
+    # THIS IS WHAT SETS:
+    #
+    # Network Type = Private Network
+    # --------------------------------------------------------
+
+    remote_query_agent = (
+        "true"
+        if USE_PRIVATE_NETWORK
+        else "false"
+    )
+
+    xml_payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<tsRequest>
+    <datasource
+        name="{datasource_name}"
+        useRemoteQueryAgent="{remote_query_agent}">
+        <project id="{project_id}" />
+    </datasource>
+</tsRequest>
+"""
+
+    boundary = (
+        "TableauBoundary"
+        + uuid.uuid4().hex
+    )
+
+    filename = os.path.basename(file_path)
+
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    # --------------------------------------------------------
+    # Build Tableau multipart/mixed body
+    # --------------------------------------------------------
+
+    body = bytearray()
+
+    # REQUEST PAYLOAD
+    body.extend(
+        f"--{boundary}\r\n".encode("utf-8")
+    )
+
+    body.extend(
+        b'Content-Disposition: name="request_payload"\r\n'
+    )
+
+    body.extend(
+        b"Content-Type: text/xml\r\n\r\n"
+    )
+
+    body.extend(
+        xml_payload.encode("utf-8")
+    )
+
+    body.extend(b"\r\n")
+
+    # DATASOURCE FILE
+    body.extend(
+        f"--{boundary}\r\n".encode("utf-8")
+    )
+
+    body.extend(
+        (
+            'Content-Disposition: '
+            'name="tableau_datasource"; '
+            f'filename="{filename}"\r\n'
+        ).encode("utf-8")
+    )
+
+    body.extend(
+        b"Content-Type: application/octet-stream\r\n\r\n"
+    )
+
+    body.extend(file_bytes)
+
+    body.extend(b"\r\n")
+
+    # END
+    body.extend(
+        f"--{boundary}--\r\n".encode("utf-8")
+    )
+
+    headers = {
+        "X-Tableau-Auth": token,
+        "Content-Type": (
+            f"multipart/mixed; boundary={boundary}"
+        ),
+        "Accept": "application/xml"
+    }
+
+    print("Datasource :", datasource_name)
+    print("File       :", file_path)
+    print(
+        "Network    :",
+        "PRIVATE NETWORK"
+        if USE_PRIVATE_NETWORK
+        else "TABLEAU CLOUD"
+    )
+
+    response = requests.post(
+        url,
+        headers=headers,
+        data=bytes(body),
+        verify=VERIFY_SSL,
+        timeout=300
+    )
+
+    print("Publish HTTP Status:", response.status_code)
+
+    if not response.ok:
+
+        print()
+        print(response.text)
+
+        raise RuntimeError(
+            f"Publish failed: {datasource_name}"
+        )
+
+    root = ET.fromstring(response.text)
+
+    datasource = find_first(
+        root,
+        "datasource"
+    )
+
+    if datasource is None:
+
+        print(response.text)
+
+        raise RuntimeError(
+            "Published datasource LUID "
+            "not returned."
+        )
+
+    datasource_id = datasource.attrib.get(
+        "id"
+    )
+
+    returned_private = datasource.attrib.get(
+        "useRemoteQueryAgent"
+    )
+
+    print()
+    print("PUBLISH SUCCESSFUL")
+    print("Datasource Name :", datasource_name)
+    print("Datasource LUID :", datasource_id)
+    print(
+        "useRemoteQueryAgent:",
+        returned_private
+    )
+
+    return (
+        datasource_name,
+        datasource_id
+    )
+
+
+# ============================================================
+# 5. QUERY DATASOURCE CONNECTIONS
+# ============================================================
+
+def get_connections(
+        token,
+        site_id,
+        datasource_id
+):
+
+    section(
+        "STEP 5 - QUERY DATASOURCE CONNECTIONS"
+    )
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}"
+        + f"/sites/{site_id}"
+        + f"/datasources/{datasource_id}"
+        + "/connections"
+    )
+
+    headers = {
+        "X-Tableau-Auth": token,
+        "Accept": "application/xml"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    print("HTTP Status:", response.status_code)
+
+    if not response.ok:
+
+        print(response.text)
+
+        raise RuntimeError(
+            "Unable to retrieve connections"
+        )
+
+    root = ET.fromstring(response.text)
+
+    connections = find_all(
+        root,
+        "connection"
+    )
+
+    print(
+        "Connections found:",
+        len(connections)
+    )
+
+    for conn in connections:
+
+        print()
+        print(
+            "Connection ID      :",
+            conn.attrib.get("id")
+        )
+
+        print(
+            "Type               :",
+            conn.attrib.get("type")
+        )
+
+        print(
+            "Server             :",
+            conn.attrib.get(
+                "serverAddress"
+            )
+        )
+
+        print(
+            "Username           :",
+            conn.attrib.get("userName")
+        )
+
+        print(
+            "Authentication Type:",
+            conn.attrib.get(
+                "authenticationType"
+            )
+        )
+
+    return connections
+
+
+# ============================================================
+# 6. FIND SNOWFLAKE CONNECTION
+# ============================================================
+
+def find_snowflake_connections(
+        connections
+):
+
+    section(
+        "STEP 6 - FIND SNOWFLAKE CONNECTION"
+    )
+
+    matches = []
+
+    for conn in connections:
+
+        server_address = (
+            conn.attrib.get(
+                "serverAddress",
+                ""
+            )
+            .strip()
+            .lower()
+        )
+
+        connection_type = (
+            conn.attrib.get(
+                "type",
+                ""
+            )
+            .strip()
+            .lower()
+        )
+
+        server_match = (
+            server_address
+            == SNOWFLAKE_SERVER.lower()
+        )
+
+        type_match = (
+            connection_type == "snowflake"
+        )
+
+        if server_match or type_match:
+
+            matches.append(conn)
+
+    if not matches:
+
+        raise RuntimeError(
+            "No Snowflake connection found."
+        )
+
+    print(
+        "Snowflake connections found:",
+        len(matches)
+    )
+
+    for conn in matches:
+
+        print(
+            " -",
+            conn.attrib.get("id"),
+            conn.attrib.get("serverAddress")
+        )
+
+    return matches
+
+
+# ============================================================
+# 7. EMBED USER + KEY-PAIR AUTH
+# ============================================================
+
+def embed_keypair_user(
+        token,
+        site_id,
+        datasource_id,
+        connection
+):
+
+    connection_id = connection.attrib.get(
+        "id"
+    )
+
+    section(
+        f"STEP 7 - EMBED USER ON {connection_id}"
+    )
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}"
+        + f"/sites/{site_id}"
+        + f"/datasources/{datasource_id}"
+        + f"/connections/{connection_id}"
+    )
+
+    # ========================================================
+    # THIS IS THE IMPORTANT PART:
+    #
+    # authenticationType = auth-keypair
+    # userName           = abc-connect
+    # embedPassword      = true
+    #
+    # No private key is sent here.
+    # ========================================================
+
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<tsRequest>
+    <connection
+        serverAddress="{SNOWFLAKE_SERVER}"
+        authenticationType="auth-keypair"
+        userName="{SNOWFLAKE_USERNAME}"
+        embedPassword="true"
+    />
+</tsRequest>
+"""
+
+    headers = {
+        "X-Tableau-Auth": token,
+        "Content-Type": "application/xml",
+        "Accept": "application/xml"
+    }
+
+    print("Snowflake Server :", SNOWFLAKE_SERVER)
+    print("Embedded User    :", SNOWFLAKE_USERNAME)
+    print("Authentication   : auth-keypair")
+    print("Embed            : true")
+
+    response = requests.put(
+        url,
+        headers=headers,
+        data=payload.encode("utf-8"),
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    print()
+    print(
+        "Update HTTP Status:",
+        response.status_code
+    )
+
+    if not response.ok:
+
+        print(response.text)
+
+        raise RuntimeError(
+            "Key-pair / embedded user update failed."
+        )
+
+    print("Embedded credential update accepted.")
+
+    if response.text.strip():
+        print()
+        print("Tableau response:")
+        print(response.text)
+
+
+# ============================================================
+# 8. VERIFY FINAL CONNECTION
+# ============================================================
+
+def verify_connection(
+        token,
+        site_id,
+        datasource_id
+):
+
+    section("STEP 8 - VERIFY FINAL SETTINGS")
+
+    connections = get_connections(
+        token,
+        site_id,
+        datasource_id
+    )
+
+    success = True
+
+    for conn in connections:
+
+        server_address = (
+            conn.attrib.get(
+                "serverAddress",
+                ""
+            )
+        )
+
+        if (
+            server_address.lower()
+            == SNOWFLAKE_SERVER.lower()
+        ):
+
+            auth_type = conn.attrib.get(
+                "authenticationType"
+            )
+
+            username = conn.attrib.get(
+                "userName"
+            )
+
+            print()
+            print("FINAL CONNECTION")
+            print(
+                "Server        :",
+                server_address
+            )
+
+            print(
+                "Username      :",
+                username
+            )
+
+            print(
+                "Authentication:",
+                auth_type
+            )
+
+            if (
+                str(auth_type).lower()
+                != "auth-keypair"
+            ):
+                success = False
+
+            if (
+                str(username).lower()
+                != SNOWFLAKE_USERNAME.lower()
+            ):
+                success = False
+
+    if success:
+
+        print()
+        print(
+            "****************************************"
+        )
+        print(
+            "SUCCESS"
+        )
+        print(
+            "****************************************"
+        )
+
+        print(
+            "1. Datasource published"
+        )
+
+        print(
+            "2. Private Network requested"
+        )
+
+        print(
+            "3. Snowflake auth = auth-keypair"
+        )
+
+        print(
+            f"4. Embedded user = "
+            f"{SNOWFLAKE_USERNAME}"
+        )
+
+    else:
+
+        print()
+        print("FINAL VERIFICATION FAILED.")
+
+    return success
+
+
+# ============================================================
+# 9. SIGN OUT
+# ============================================================
+
+def sign_out(token):
+
+    try:
+
+        url = (
+            CLOUD_URL.rstrip("/")
+            + f"/api/{REST_API}/auth/signout"
+        )
+
+        headers = {
+            "X-Tableau-Auth": token
+        }
+
+        requests.post(
+            url,
+            headers=headers,
+            verify=VERIFY_SSL,
+            timeout=30
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    token = None
+
+    try:
+
+        section(
+            "TABLEAU LOCAL DATASOURCE MIGRATION"
+        )
+
+        print(
+            "Python:",
+            sys.version
+        )
+
+        print(
+            "Tableau Cloud:",
+            CLOUD_URL
+        )
+
+        print(
+            "Site:",
+            CLOUD_SITE
+        )
+
+        print(
+            "Project:",
+            PROJECT_NAME
+        )
+
+        print(
+            "Snowflake Server:",
+            SNOWFLAKE_SERVER
+        )
+
+        print(
+            "Snowflake User:",
+            SNOWFLAKE_USERNAME
+        )
+
+        # ----------------------------------------------------
+        # Sign in
+        # ----------------------------------------------------
+
+        token, site_id = sign_in()
+
+        # ----------------------------------------------------
+        # Get target project
+        # ----------------------------------------------------
+
+        project_id = get_project_id(
+            token,
+            site_id
+        )
+
+        # --------------------------------------------------
