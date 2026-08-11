@@ -1,0 +1,899 @@
+import os
+import sys
+import getpass
+import requests
+import xml.etree.ElementTree as ET
+import urllib3
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Tableau Cloud
+CLOUD_URL = "https://abc.cloud.com"
+CLOUD_SITE = "abc"
+
+# REST API
+REST_API = "3.29"
+
+# Tableau PAT
+PAT_NAME = "SA-Cloud"
+
+# Recommended:
+# Set TABLEAU_PAT_SECRET as environment variable.
+#
+# PowerShell:
+# $env:TABLEAU_PAT_SECRET="xxxxxxxx"
+#
+PAT_SECRET = os.getenv("TABLEAU_PAT_SECRET")
+
+# ------------------------------------------------------------
+# Published datasource
+# ------------------------------------------------------------
+
+# Put the LUID of your TEST published datasource here.
+DATASOURCE_ID = "YOUR_DATASOURCE_LUID"
+
+# Optional:
+# If you already know the connection ID, enter it here.
+# Otherwise leave blank and script will auto-detect it.
+CONNECTION_ID = ""
+
+# ------------------------------------------------------------
+# Snowflake saved key-pair information
+# ------------------------------------------------------------
+
+SNOWFLAKE_SERVER = "abc.snowflake.com"
+SNOWFLAKE_USERNAME = "abc-connect"
+
+# ------------------------------------------------------------
+# SSL
+# ------------------------------------------------------------
+
+# Keep True normally.
+# Change only if your corporate environment has SSL issues.
+VERIFY_SSL = False
+
+
+# ============================================================
+# SETUP
+# ============================================================
+
+if not VERIFY_SSL:
+    urllib3.disable_warnings(
+        urllib3.exceptions.InsecureRequestWarning
+    )
+
+
+def section(title):
+    print()
+    print("=" * 90)
+    print(title)
+    print("=" * 90)
+
+
+def short_response(response):
+    print("HTTP status :", response.status_code)
+
+    if response.text:
+        print("Response:")
+        print(response.text[:4000])
+    else:
+        print("Response body: <empty>")
+
+
+def local_name(tag):
+    """
+    Removes XML namespace.
+
+    Example:
+    {http://tableau.com/api}connection
+        becomes
+    connection
+    """
+    return tag.split("}")[-1]
+
+
+def find_first(root, name):
+
+    for element in root.iter():
+
+        if local_name(element.tag) == name:
+            return element
+
+    return None
+
+
+def find_all(root, name):
+
+    result = []
+
+    for element in root.iter():
+
+        if local_name(element.tag) == name:
+            result.append(element)
+
+    return result
+
+
+# ============================================================
+# STEP 1 - SIGN IN USING PAT
+# ============================================================
+
+def tableau_signin():
+
+    global PAT_SECRET
+
+    section("STEP 1 - TABLEAU SIGN IN")
+
+    if not PAT_SECRET:
+
+        print(
+            "TABLEAU_PAT_SECRET environment variable "
+            "not found."
+        )
+
+        PAT_SECRET = getpass.getpass(
+            "Enter Tableau PAT secret: "
+        )
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}/auth/signin"
+    )
+
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<tsRequest>
+    <credentials
+        personalAccessTokenName="{PAT_NAME}"
+        personalAccessTokenSecret="{PAT_SECRET}">
+        <site contentUrl="{CLOUD_SITE}" />
+    </credentials>
+</tsRequest>
+"""
+
+    headers = {
+        "Content-Type": "application/xml",
+        "Accept": "application/xml"
+    }
+
+    print("Cloud URL :", CLOUD_URL)
+    print("Site      :", CLOUD_SITE)
+    print("REST API  :", REST_API)
+    print("PAT Name  :", PAT_NAME)
+
+    response = requests.post(
+        url,
+        headers=headers,
+        data=payload.encode("utf-8"),
+        timeout=60,
+        verify=VERIFY_SSL
+    )
+
+    print()
+    print("Sign-in response:")
+    print("HTTP status:", response.status_code)
+
+    if not response.ok:
+
+        print(response.text)
+
+        raise RuntimeError(
+            "Tableau sign-in failed."
+        )
+
+    root = ET.fromstring(response.text)
+
+    credentials = find_first(
+        root,
+        "credentials"
+    )
+
+    if credentials is None:
+
+        print(response.text)
+
+        raise RuntimeError(
+            "credentials element not found "
+            "in Tableau sign-in response."
+        )
+
+    token = credentials.attrib.get("token")
+
+    site = find_first(
+        credentials,
+        "site"
+    )
+
+    if site is None:
+        site = find_first(root, "site")
+
+    site_id = (
+        site.attrib.get("id")
+        if site is not None
+        else None
+    )
+
+    if not token:
+        raise RuntimeError(
+            "Tableau authentication token missing."
+        )
+
+    if not site_id:
+        raise RuntimeError(
+            "Tableau site LUID missing."
+        )
+
+    print()
+    print("SIGN IN SUCCESSFUL")
+    print("Site LUID :", site_id)
+    print("Token     : <received - hidden>")
+
+    return token, site_id
+
+
+# ============================================================
+# STEP 2 - QUERY CONNECTIONS
+# ============================================================
+
+def query_connections(token, site_id):
+
+    section("STEP 2 - QUERY DATASOURCE CONNECTIONS")
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}"
+        + f"/sites/{site_id}"
+        + f"/datasources/{DATASOURCE_ID}"
+        + "/connections"
+    )
+
+    headers = {
+        "X-Tableau-Auth": token,
+        "Accept": "application/xml"
+    }
+
+    print("GET:")
+    print(url)
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=60,
+        verify=VERIFY_SSL
+    )
+
+    print()
+    print("HTTP status:", response.status_code)
+
+    if not response.ok:
+
+        print(response.text)
+
+        raise RuntimeError(
+            "Unable to query datasource connections."
+        )
+
+    root = ET.fromstring(response.text)
+
+    connections = find_all(
+        root,
+        "connection"
+    )
+
+    print()
+    print(
+        "Number of connections:",
+        len(connections)
+    )
+
+    for index, conn in enumerate(
+        connections,
+        start=1
+    ):
+
+        print()
+        print(
+            f"---------- CONNECTION {index} ----------"
+        )
+
+        print(
+            "id                 :",
+            conn.attrib.get("id")
+        )
+
+        print(
+            "type               :",
+            conn.attrib.get("type")
+        )
+
+        print(
+            "serverAddress      :",
+            conn.attrib.get("serverAddress")
+        )
+
+        print(
+            "serverPort         :",
+            conn.attrib.get("serverPort")
+        )
+
+        print(
+            "userName           :",
+            conn.attrib.get("userName")
+        )
+
+        print(
+            "authenticationType :",
+            conn.attrib.get(
+                "authenticationType"
+            )
+        )
+
+        print(
+            "embedPassword      :",
+            conn.attrib.get(
+                "embedPassword"
+            )
+        )
+
+    return connections
+
+
+# ============================================================
+# STEP 3 - FIND TARGET SNOWFLAKE CONNECTION
+# ============================================================
+
+def find_target_connection(connections):
+
+    section("STEP 3 - FIND TARGET SNOWFLAKE CONNECTION")
+
+    # --------------------------------------------------------
+    # User provided connection ID
+    # --------------------------------------------------------
+
+    if CONNECTION_ID:
+
+        for conn in connections:
+
+            if conn.attrib.get("id") == CONNECTION_ID:
+
+                print(
+                    "Using configured CONNECTION_ID:"
+                )
+
+                print(CONNECTION_ID)
+
+                return CONNECTION_ID
+
+        raise RuntimeError(
+            "Configured CONNECTION_ID was not found."
+        )
+
+    # --------------------------------------------------------
+    # Automatic match
+    # --------------------------------------------------------
+
+    exact_matches = []
+
+    for conn in connections:
+
+        server_address = (
+            conn.attrib.get(
+                "serverAddress",
+                ""
+            )
+            .strip()
+            .lower()
+        )
+
+        username = (
+            conn.attrib.get(
+                "userName",
+                ""
+            )
+            .strip()
+            .lower()
+        )
+
+        if (
+            server_address
+            == SNOWFLAKE_SERVER.lower()
+            and
+            username
+            == SNOWFLAKE_USERNAME.lower()
+        ):
+            exact_matches.append(conn)
+
+    if len(exact_matches) == 1:
+
+        conn_id = exact_matches[0].attrib.get(
+            "id"
+        )
+
+        print("Exact connection found.")
+        print("Connection ID:", conn_id)
+
+        return conn_id
+
+    if len(exact_matches) > 1:
+
+        raise RuntimeError(
+            "More than one connection matched "
+            "server + username. Set CONNECTION_ID "
+            "manually."
+        )
+
+    # --------------------------------------------------------
+    # Server-only fallback
+    # --------------------------------------------------------
+
+    server_matches = []
+
+    for conn in connections:
+
+        server_address = (
+            conn.attrib.get(
+                "serverAddress",
+                ""
+            )
+            .strip()
+            .lower()
+        )
+
+        if (
+            server_address
+            == SNOWFLAKE_SERVER.lower()
+        ):
+            server_matches.append(conn)
+
+    if len(server_matches) == 1:
+
+        conn_id = server_matches[0].attrib.get(
+            "id"
+        )
+
+        print(
+            "Exact username match was not found, "
+            "but Snowflake server matched."
+        )
+
+        print("Connection ID:", conn_id)
+
+        return conn_id
+
+    print()
+    print("EXPECTED:")
+    print(
+        "Server  :",
+        SNOWFLAKE_SERVER
+    )
+
+    print(
+        "Username:",
+        SNOWFLAKE_USERNAME
+    )
+
+    raise RuntimeError(
+        "Could not uniquely identify "
+        "Snowflake connection."
+    )
+
+
+# ============================================================
+# STEP 4 - UPDATE TO KEY-PAIR AUTH
+# ============================================================
+
+def update_to_keypair(
+    token,
+    site_id,
+    connection_id
+):
+
+    section(
+        "STEP 4 - UPDATE CONNECTION TO KEY-PAIR AUTH"
+    )
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}"
+        + f"/sites/{site_id}"
+        + f"/datasources/{DATASOURCE_ID}"
+        + f"/connections/{connection_id}"
+    )
+
+    # Important:
+    #
+    # No private key is sent.
+    #
+    # Tableau should use the saved key-pair credential
+    # associated with the Snowflake server + username.
+    #
+    payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<tsRequest>
+    <connection
+        serverAddress="{SNOWFLAKE_SERVER}"
+        authenticationType="auth-keypair"
+        userName="{SNOWFLAKE_USERNAME}"
+        embedPassword="true"
+    />
+</tsRequest>
+"""
+
+    headers = {
+        "X-Tableau-Auth": token,
+        "Content-Type": "application/xml",
+        "Accept": "application/xml"
+    }
+
+    print("PUT:")
+    print(url)
+
+    print()
+    print("REQUEST BODY:")
+    print(payload)
+
+    response = requests.put(
+        url,
+        headers=headers,
+        data=payload.encode("utf-8"),
+        timeout=60,
+        verify=VERIFY_SSL
+    )
+
+    print()
+    print("UPDATE RESPONSE")
+    print("HTTP status:", response.status_code)
+
+    if response.text:
+
+        print()
+        print(response.text)
+
+    if not response.ok:
+
+        raise RuntimeError(
+            "Key-pair connection update failed."
+        )
+
+    print()
+    print(
+        "REST UPDATE ACCEPTED BY TABLEAU"
+    )
+
+    # --------------------------------------------------------
+    # Parse update response
+    # --------------------------------------------------------
+
+    if response.text.strip():
+
+        try:
+
+            root = ET.fromstring(
+                response.text
+            )
+
+            connection = find_first(
+                root,
+                "connection"
+            )
+
+            if connection is not None:
+
+                print()
+                print(
+                    "RETURNED CONNECTION ATTRIBUTES"
+                )
+
+                for key, value in (
+                    connection.attrib.items()
+                ):
+                    print(
+                        f"{key:25}: {value}"
+                    )
+
+        except Exception as exc:
+
+            print(
+                "Could not parse update response:",
+                exc
+            )
+
+
+# ============================================================
+# STEP 5 - READ BACK CONNECTION
+# ============================================================
+
+def verify_connection(
+    token,
+    site_id,
+    connection_id
+):
+
+    section(
+        "STEP 5 - READ BACK FROM TABLEAU CLOUD"
+    )
+
+    connections = query_connections(
+        token,
+        site_id
+    )
+
+    target = None
+
+    for conn in connections:
+
+        if (
+            conn.attrib.get("id")
+            == connection_id
+        ):
+            target = conn
+            break
+
+    if target is None:
+
+        raise RuntimeError(
+            "Connection not found after update."
+        )
+
+    auth_type = target.attrib.get(
+        "authenticationType"
+    )
+
+    username = target.attrib.get(
+        "userName"
+    )
+
+    server_address = target.attrib.get(
+        "serverAddress"
+    )
+
+    embed_password = target.attrib.get(
+        "embedPassword"
+    )
+
+    section("FINAL RESULT")
+
+    print(
+        "Connection ID      :",
+        connection_id
+    )
+
+    print(
+        "Server             :",
+        server_address
+    )
+
+    print(
+        "Username           :",
+        username
+    )
+
+    print(
+        "Authentication Type:",
+        auth_type
+    )
+
+    print(
+        "Embed Password     :",
+        embed_password
+    )
+
+    if (
+        str(auth_type).lower()
+        == "auth-keypair"
+    ):
+
+        print()
+        print("================================")
+        print("SUCCESS")
+        print("================================")
+        print(
+            "Tableau REST read-back shows:"
+        )
+
+        print(
+            "authenticationType = auth-keypair"
+        )
+
+        print()
+        print(
+            "Now check Edit Connection "
+            "in Tableau Cloud."
+        )
+
+        print(
+            "The saved account should appear "
+            "under Embedded credentials."
+        )
+
+        return True
+
+    else:
+
+        print()
+        print("================================")
+        print("NOT SUCCESSFUL")
+        print("================================")
+
+        print(
+            "Tableau accepted the PUT, "
+            "but read-back is not auth-keypair."
+        )
+
+        print()
+        print(
+            "Send me:"
+        )
+
+        print("1. STEP 2 output")
+        print("2. STEP 4 response")
+        print("3. FINAL RESULT")
+
+        return False
+
+
+# ============================================================
+# STEP 6 - SIGN OUT
+# ============================================================
+
+def tableau_signout(token):
+
+    section("SIGN OUT")
+
+    url = (
+        CLOUD_URL.rstrip("/")
+        + f"/api/{REST_API}/auth/signout"
+    )
+
+    headers = {
+        "X-Tableau-Auth": token
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers=headers,
+            timeout=30,
+            verify=VERIFY_SSL
+        )
+
+        print(
+            "Sign-out HTTP status:",
+            response.status_code
+        )
+
+    except Exception as exc:
+
+        print(
+            "Sign-out warning:",
+            exc
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    token = None
+
+    try:
+
+        section(
+            "TABLEAU SNOWFLAKE KEY-PAIR REST DEBUG"
+        )
+
+        print("Python version:")
+        print(sys.version)
+
+        print()
+        print("CONFIGURATION")
+
+        print(
+            "Tableau Cloud :",
+            CLOUD_URL
+        )
+
+        print(
+            "Tableau Site  :",
+            CLOUD_SITE
+        )
+
+        print(
+            "Datasource ID :",
+            DATASOURCE_ID
+        )
+
+        print(
+            "Snowflake     :",
+            SNOWFLAKE_SERVER
+        )
+
+        print(
+            "Snowflake User:",
+            SNOWFLAKE_USERNAME
+        )
+
+        # ----------------------------------------------------
+        # Sign in
+        # ----------------------------------------------------
+
+        token, site_id = tableau_signin()
+
+        # ----------------------------------------------------
+        # Existing connections
+        # ----------------------------------------------------
+
+        connections = query_connections(
+            token,
+            site_id
+        )
+
+        # ----------------------------------------------------
+        # Find Snowflake connection
+        # ----------------------------------------------------
+
+        connection_id = (
+            find_target_connection(
+                connections
+            )
+        )
+
+        # ----------------------------------------------------
+        # Update
+        # ----------------------------------------------------
+
+        update_to_keypair(
+            token,
+            site_id,
+            connection_id
+        )
+
+        # ----------------------------------------------------
+        # Verify from Tableau
+        # ----------------------------------------------------
+
+        success = verify_connection(
+            token,
+            site_id,
+            connection_id
+        )
+
+        if success:
+
+            section("DEBUG TEST COMPLETE")
+
+            print(
+                "REST API key-pair update succeeded."
+            )
+
+        else:
+
+            section(
+                "DEBUG TEST FINISHED WITH WARNING"
+            )
+
+    except Exception as exc:
+
+        section("ERROR")
+
+        print(
+            type(exc).__name__
+            + ": "
+            + str(exc)
+        )
+
+        raise
+
+    finally:
+
+        if token:
+
+            tableau_signout(token)
+
+
+if __name__ == "__main__":
+    main()
