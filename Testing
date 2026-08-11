@@ -1,0 +1,530 @@
+import os
+import sys
+import traceback
+import tableauserverclient as TSC
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CLOUD_URL = "https://online.tableau.com"
+
+# Tableau site CONTENT URL, not display name
+CLOUD_SITE = "tableau"
+
+PAT_NAME = "SA-Cloud"
+
+# Recommended:
+# Set TABLEAU_PAT_SECRET as an environment variable.
+PAT_SECRET = os.getenv("TABLEAU_PAT_SECRET")
+
+# Existing published datasource to test
+DS_NAME = "ZZ_DEBUG_EMBED_SF"
+
+# Snowflake values matching your SAVED key-pair credential
+SNOWFLAKE_SERVER = (
+    "snowflakecomputing.com"
+)
+
+SNOWFLAKE_USERNAME = "SA-JAspc"
+
+# Keep False initially.
+# Change to True only after you verify the connection in Tableau Cloud.
+RUN_REFRESH_TEST = False
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def line():
+    print("=" * 90)
+
+
+def dump_connection(conn, label):
+    print()
+    print(f"---------- {label} ----------")
+
+    attrs = [
+        "id",
+        "connection_type",
+        "server_address",
+        "server_port",
+        "username",
+        "auth_type",
+        "authentication_type",
+        "embed_password",
+        "query_tagging_enabled",
+    ]
+
+    for attr in attrs:
+        try:
+            value = getattr(conn, attr, "<not exposed by TSC>")
+        except Exception as exc:
+            value = f"<error reading: {exc}>"
+
+        print(f"{attr:25}: {value}")
+
+    print("------------------------------")
+
+
+def version_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return (0,)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    line()
+    print("TABLEAU SNOWFLAKE KEYPAIR DEBUG")
+    line()
+
+    # --------------------------------------------------------
+    # 0. PAT check
+    # --------------------------------------------------------
+
+    if not PAT_SECRET:
+        print()
+        print("ERROR: TABLEAU_PAT_SECRET environment variable is not set.")
+        print()
+        print("PowerShell example:")
+        print('$env:TABLEAU_PAT_SECRET="YOUR_NEW_PAT_SECRET"')
+        print()
+        sys.exit(1)
+
+    print("TSC package version:",
+          getattr(TSC, "__version__", "unknown"))
+
+    # --------------------------------------------------------
+    # 1. Create server
+    # --------------------------------------------------------
+
+    server = TSC.Server(
+        CLOUD_URL,
+        use_server_version=True
+    )
+
+    # --------------------------------------------------------
+    # 2. Check Tableau supported REST API version
+    # --------------------------------------------------------
+
+    try:
+        info = server.server_info.get()
+
+        print("Tableau product version :", info.product_version)
+        print("Tableau REST API version:", info.rest_api_version)
+        print("Tableau build            :", info.build_number)
+
+        if version_tuple(info.rest_api_version) < (3, 27):
+            print()
+            print("FAIL:")
+            print("REST API 3.27+ is required for auth-keypair.")
+            sys.exit(1)
+
+    except Exception as exc:
+        print("Could not retrieve ServerInfo:")
+        print(exc)
+
+    # --------------------------------------------------------
+    # 3. Sign in
+    # --------------------------------------------------------
+
+    auth = TSC.PersonalAccessTokenAuth(
+        PAT_NAME,
+        PAT_SECRET,
+        site_id=CLOUD_SITE
+    )
+
+    try:
+
+        with server.auth.sign_in(auth):
+
+            print()
+            print("SIGNED IN SUCCESSFULLY")
+            print("TSC REST API being used:", server.version)
+
+            if version_tuple(server.version) < (3, 27):
+                print()
+                print("ERROR:")
+                print(
+                    "TSC is currently using REST API "
+                    f"{server.version}, but keypair requires 3.27+."
+                )
+                print()
+                print(
+                    "Upgrade tableauserverclient and rerun:"
+                )
+                print(
+                    "pip install --upgrade tableauserverclient"
+                )
+                sys.exit(1)
+
+            # ------------------------------------------------
+            # 4. Find datasource
+            # ------------------------------------------------
+
+            print()
+            print(f"Searching datasource: {DS_NAME}")
+
+            matches = []
+
+            for ds in TSC.Pager(server.datasources):
+                if ds.name == DS_NAME:
+                    matches.append(ds)
+
+            if not matches:
+                print()
+                print("ERROR: datasource not found:")
+                print(DS_NAME)
+                sys.exit(1)
+
+            if len(matches) > 1:
+                print()
+                print("WARNING: More than one datasource found.")
+
+                for d in matches:
+                    print(
+                        f"Name={d.name} | "
+                        f"ID={d.id} | "
+                        f"Project={getattr(d, 'project_name', '')}"
+                    )
+
+                print()
+                print("Using the first match for this test.")
+
+            ds = matches[0]
+
+            print()
+            print("DATASOURCE FOUND")
+            print("Name       :", ds.name)
+            print("ID         :", ds.id)
+            print(
+                "Project     :",
+                getattr(ds, "project_name", "")
+            )
+            print(
+                "Project ID  :",
+                getattr(ds, "project_id", "")
+            )
+
+            # ------------------------------------------------
+            # 5. Read current connections
+            # ------------------------------------------------
+
+            print()
+            line()
+            print("STEP 1 - CURRENT CONNECTIONS")
+            line()
+
+            server.datasources.populate_connections(ds)
+
+            if not ds.connections:
+                print("ERROR: No datasource connections returned.")
+                sys.exit(1)
+
+            print(
+                "Number of connections:",
+                len(ds.connections)
+            )
+
+            target_conn = None
+
+            for i, conn in enumerate(ds.connections, 1):
+
+                dump_connection(
+                    conn,
+                    f"CONNECTION {i} - BEFORE"
+                )
+
+                connection_type = str(
+                    getattr(conn, "connection_type", "")
+                ).lower()
+
+                server_address = str(
+                    getattr(conn, "server_address", "")
+                ).lower()
+
+                # Primary match
+                if (
+                    connection_type == "snowflake"
+                    and
+                    server_address == SNOWFLAKE_SERVER.lower()
+                ):
+                    target_conn = conn
+
+            # Fallback if Tableau returns a slightly
+            # different connection type/server representation
+            if target_conn is None:
+
+                print()
+                print(
+                    "Exact server match not found. "
+                    "Trying Snowflake connection-type match..."
+                )
+
+                for conn in ds.connections:
+
+                    if (
+                        str(
+                            getattr(
+                                conn,
+                                "connection_type",
+                                ""
+                            )
+                        ).lower()
+                        == "snowflake"
+                    ):
+                        target_conn = conn
+                        break
+
+            if target_conn is None:
+                print()
+                print("ERROR:")
+                print("No Snowflake connection was found.")
+                sys.exit(1)
+
+            target_id = target_conn.id
+
+            print()
+            line()
+            print("TARGET SNOWFLAKE CONNECTION")
+            line()
+
+            dump_connection(
+                target_conn,
+                "TARGET BEFORE UPDATE"
+            )
+
+            # ------------------------------------------------
+            # 6. Apply key-pair settings
+            # ------------------------------------------------
+
+            print()
+            line()
+            print("STEP 2 - SETTING KEYPAIR AUTH")
+            line()
+
+            print(
+                "Setting auth_type      = auth-keypair"
+            )
+            print(
+                "Setting username       =",
+                SNOWFLAKE_USERNAME
+            )
+            print(
+                "Setting embed_password = True"
+            )
+
+            target_conn.auth_type = "auth-keypair"
+            target_conn.username = SNOWFLAKE_USERNAME
+            target_conn.embed_password = True
+
+            dump_connection(
+                target_conn,
+                "OBJECT BEFORE PUT"
+            )
+
+            # ------------------------------------------------
+            # 7. Send update
+            # ------------------------------------------------
+
+            print()
+            print("Sending update_connection() ...")
+
+            try:
+                updated = (
+                    server.datasources.update_connection(
+                        ds,
+                        target_conn
+                    )
+                )
+
+                print()
+                print("UPDATE CALL COMPLETED")
+
+                if updated is not None:
+                    dump_connection(
+                        updated,
+                        "TSC UPDATE RESPONSE"
+                    )
+
+            except Exception as exc:
+
+                print()
+                print("!!!!!!!! UPDATE FAILED !!!!!!!!")
+                print()
+                print("Exception type:", type(exc).__name__)
+                print("Exception     :", exc)
+                print()
+
+                traceback.print_exc()
+
+                print()
+                print(
+                    "If this says unsupported/invalid "
+                    "authenticationType, check TSC and REST "
+                    "API versions above."
+                )
+
+                sys.exit(1)
+
+            # ------------------------------------------------
+            # 8. READ BACK FROM TABLEAU CLOUD
+            # ------------------------------------------------
+
+            print()
+            line()
+            print("STEP 3 - READ BACK FROM TABLEAU CLOUD")
+            line()
+
+            # Re-fetch datasource so this isn't just
+            # displaying our modified Python object.
+            fresh_ds = None
+
+            for item in TSC.Pager(server.datasources):
+                if item.id == ds.id:
+                    fresh_ds = item
+                    break
+
+            if fresh_ds is None:
+                print("ERROR: Could not reload datasource.")
+                sys.exit(1)
+
+            server.datasources.populate_connections(
+                fresh_ds
+            )
+
+            after_conn = None
+
+            for conn in fresh_ds.connections:
+                if conn.id == target_id:
+                    after_conn = conn
+                    break
+
+            if after_conn is None:
+                print(
+                    "ERROR: Could not find connection "
+                    "after update."
+                )
+                sys.exit(1)
+
+            dump_connection(
+                after_conn,
+                "CONNECTION AFTER READ-BACK"
+            )
+
+            # ------------------------------------------------
+            # 9. Evaluate
+            # ------------------------------------------------
+
+            print()
+            line()
+            print("RESULT")
+            line()
+
+            after_auth = getattr(
+                after_conn,
+                "auth_type",
+                None
+            )
+
+            after_user = getattr(
+                after_conn,
+                "username",
+                None
+            )
+
+            print("Returned auth_type :", after_auth)
+            print("Returned username  :", after_user)
+
+            if (
+                str(after_auth).lower()
+                == "auth-keypair"
+                and
+                str(after_user).lower()
+                == SNOWFLAKE_USERNAME.lower()
+            ):
+
+                print()
+                print("SUCCESS:")
+                print(
+                    "Tableau read-back shows "
+                    "authenticationType = auth-keypair."
+                )
+
+            else:
+
+                print()
+                print("WARNING:")
+                print(
+                    "The read-back does NOT show the "
+                    "expected keypair authentication."
+                )
+                print(
+                    "Send me the complete output from "
+                    "TARGET BEFORE UPDATE through RESULT."
+                )
+
+            # ------------------------------------------------
+            # 10. Optional refresh
+            # ------------------------------------------------
+
+            if RUN_REFRESH_TEST:
+
+                print()
+                line()
+                print("STEP 4 - OPTIONAL REFRESH TEST")
+                line()
+
+                try:
+                    job = server.datasources.refresh(
+                        fresh_ds
+                    )
+
+                    print(
+                        "Refresh submitted successfully."
+                    )
+
+                    if job is not None:
+                        print(
+                            "Job ID:",
+                            getattr(job, "id", job)
+                        )
+
+                except Exception as exc:
+                    print()
+                    print("REFRESH SUBMISSION FAILED:")
+                    print(exc)
+                    traceback.print_exc()
+
+            else:
+                print()
+                print(
+                    "Refresh test skipped "
+                    "(RUN_REFRESH_TEST=False)."
+                )
+
+            print()
+            line()
+            print("DEBUG TEST COMPLETE")
+            line()
+
+
+    except Exception as exc:
+
+        print()
+        print("SIGN-IN / MAIN FAILURE")
+        print(type(exc).__name__, ":", exc)
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
