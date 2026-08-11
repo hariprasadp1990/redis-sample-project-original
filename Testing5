@@ -1,0 +1,591 @@
+import os
+import sys
+import uuid
+import getpass
+import requests
+import urllib3
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
+
+CLOUD_URL = "https://abc.cloud.com"
+CLOUD_SITE = "abc"
+REST_API = "3.29"
+PAT_NAME = "SA-Cloud"
+
+LOCAL_PATH = r"C:\Tableau\Migration\MyDatasource.tdsx"
+PROJECT_NAME = "My Project"
+
+SNOWFLAKE_SERVER = "abc.snowflake.com"
+SNOWFLAKE_USERNAME = "abc-connect"
+
+VERIFY_SSL = False
+OVERWRITE = True
+
+if not VERIFY_SSL:
+    urllib3.disable_warnings(
+        urllib3.exceptions.InsecureRequestWarning
+    )
+
+
+def tag_name(tag):
+    return tag.split("}")[-1]
+
+
+def elems(root, name):
+    return [
+        x for x in root.iter()
+        if tag_name(x.tag) == name
+    ]
+
+
+def first(root, name):
+    for x in root.iter():
+        if tag_name(x.tag) == name:
+            return x
+    return None
+
+
+def check(resp, action):
+    print(f"{action}: HTTP {resp.status_code}")
+
+    if not resp.ok:
+        print(resp.text)
+        raise RuntimeError(
+            f"{action} failed"
+        )
+
+
+def headers(token, content_type=None):
+    h = {
+        "X-Tableau-Auth": token,
+        "Accept": "application/xml"
+    }
+
+    if content_type:
+        h["Content-Type"] = content_type
+
+    return h
+
+
+def sign_in():
+    secret = getpass.getpass(
+        "PAT secret: "
+    )
+
+    url = (
+        f"{CLOUD_URL}/api/{REST_API}"
+        f"/auth/signin"
+    )
+
+    xml = (
+        f'<tsRequest>'
+        f'<credentials '
+        f'personalAccessTokenName="{escape(PAT_NAME)}" '
+        f'personalAccessTokenSecret="{escape(secret)}">'
+        f'<site contentUrl="{escape(CLOUD_SITE)}"/>'
+        f'</credentials>'
+        f'</tsRequest>'
+    )
+
+    r = requests.post(
+        url,
+        headers={
+            "Content-Type": "application/xml",
+            "Accept": "application/xml"
+        },
+        data=xml.encode("utf-8"),
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    check(r, "Sign in")
+
+    root = ET.fromstring(r.text)
+    cred = first(root, "credentials")
+    site = first(root, "site")
+
+    if cred is None or site is None:
+        raise RuntimeError(
+            "Token/site not returned"
+        )
+
+    token = cred.attrib["token"]
+    site_id = site.attrib["id"]
+
+    print("Site ID:", site_id)
+
+    return token, site_id
+
+
+def sign_out(token):
+    try:
+        requests.post(
+            f"{CLOUD_URL}/api/{REST_API}/auth/signout",
+            headers={
+                "X-Tableau-Auth": token
+            },
+            verify=VERIFY_SSL,
+            timeout=30
+        )
+    except Exception:
+        pass
+
+
+def get_project_id(token, site_id):
+    url = (
+        f"{CLOUD_URL}/api/{REST_API}"
+        f"/sites/{site_id}/projects"
+        f"?pageSize=1000"
+    )
+
+    r = requests.get(
+        url,
+        headers=headers(token),
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    check(r, "Get projects")
+
+    root = ET.fromstring(r.text)
+
+    matches = [
+        p for p in elems(root, "project")
+        if p.attrib.get(
+            "name", ""
+        ).casefold() == PROJECT_NAME.casefold()
+    ]
+
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected 1 project named "
+            f"'{PROJECT_NAME}', "
+            f"found {len(matches)}"
+        )
+
+    project_id = matches[0].attrib["id"]
+
+    print("Project ID:", project_id)
+
+    return project_id
+
+
+def local_files():
+    valid = (
+        ".tds",
+        ".tdsx"
+    )
+
+    if os.path.isfile(LOCAL_PATH):
+
+        files = (
+            [LOCAL_PATH]
+            if LOCAL_PATH.lower().endswith(valid)
+            else []
+        )
+
+    elif os.path.isdir(LOCAL_PATH):
+
+        files = [
+            os.path.join(
+                LOCAL_PATH,
+                f
+            )
+            for f in os.listdir(LOCAL_PATH)
+            if (
+                f.lower().endswith(valid)
+                and os.path.isfile(
+                    os.path.join(
+                        LOCAL_PATH,
+                        f
+                    )
+                )
+            )
+        ]
+
+    else:
+        files = []
+
+    if not files:
+        raise RuntimeError(
+            "No .tds/.tdsx files found"
+        )
+
+    return files
+
+
+def publish(
+    token,
+    site_id,
+    project_id,
+    path
+):
+    if os.path.getsize(path) > 64 * 1024 * 1024:
+        raise RuntimeError(
+            "File is over 64 MB. "
+            "Chunked upload is required."
+        )
+
+    name = os.path.splitext(
+        os.path.basename(path)
+    )[0]
+
+    overwrite = (
+        "true"
+        if OVERWRITE
+        else "false"
+    )
+
+    url = (
+        f"{CLOUD_URL}/api/{REST_API}"
+        f"/sites/{site_id}/datasources"
+        f"?overwrite={overwrite}"
+    )
+
+    request_xml = (
+        f'<tsRequest>'
+        f'<datasource '
+        f'name="{escape(name)}" '
+        f'useRemoteQueryAgent="true">'
+        f'<project id="{project_id}"/>'
+        f'</datasource>'
+        f'</tsRequest>'
+    )
+
+    boundary = (
+        "TableauBoundary"
+        + uuid.uuid4().hex
+    )
+
+    filename = os.path.basename(path)
+
+    with open(path, "rb") as f:
+        file_bytes = f.read()
+
+    body = bytearray()
+
+    body.extend(
+        f"--{boundary}\r\n".encode()
+    )
+
+    body.extend(
+        b'Content-Disposition: '
+        b'name="request_payload"\r\n'
+    )
+
+    body.extend(
+        b"Content-Type: text/xml\r\n\r\n"
+    )
+
+    body.extend(
+        request_xml.encode("utf-8")
+    )
+
+    body.extend(b"\r\n")
+
+    body.extend(
+        f"--{boundary}\r\n".encode()
+    )
+
+    body.extend(
+        (
+            'Content-Disposition: '
+            'name="tableau_datasource"; '
+            f'filename="{filename}"\r\n'
+        ).encode()
+    )
+
+    body.extend(
+        b"Content-Type: "
+        b"application/octet-stream\r\n\r\n"
+    )
+
+    body.extend(file_bytes)
+    body.extend(b"\r\n")
+
+    body.extend(
+        f"--{boundary}--\r\n".encode()
+    )
+
+    r = requests.post(
+        url,
+        headers=headers(
+            token,
+            f"multipart/mixed; "
+            f"boundary={boundary}"
+        ),
+        data=bytes(body),
+        verify=VERIFY_SSL,
+        timeout=300
+    )
+
+    check(
+        r,
+        f"Publish {name}"
+    )
+
+    root = ET.fromstring(r.text)
+    ds = first(root, "datasource")
+
+    if (
+        ds is None
+        or not ds.attrib.get("id")
+    ):
+        raise RuntimeError(
+            "Datasource ID not returned"
+        )
+
+    ds_id = ds.attrib["id"]
+
+    print(
+        "Published:",
+        name
+    )
+
+    print(
+        "Datasource ID:",
+        ds_id
+    )
+
+    print(
+        "Private Network:",
+        ds.attrib.get(
+            "useRemoteQueryAgent"
+        )
+    )
+
+    return name, ds_id
+
+
+def get_connections(
+    token,
+    site_id,
+    ds_id
+):
+    url = (
+        f"{CLOUD_URL}/api/{REST_API}"
+        f"/sites/{site_id}"
+        f"/datasources/{ds_id}"
+        f"/connections"
+    )
+
+    r = requests.get(
+        url,
+        headers=headers(token),
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    check(
+        r,
+        "Get connections"
+    )
+
+    root = ET.fromstring(r.text)
+
+    return elems(
+        root,
+        "connection"
+    )
+
+
+def is_snowflake(conn):
+    server = conn.attrib.get(
+        "serverAddress",
+        ""
+    ).casefold()
+
+    ctype = conn.attrib.get(
+        "type",
+        ""
+    ).casefold()
+
+    return (
+        server
+        == SNOWFLAKE_SERVER.casefold()
+        or
+        ctype == "snowflake"
+    )
+
+
+def embed_keypair(
+    token,
+    site_id,
+    ds_id,
+    conn
+):
+    conn_id = conn.attrib["id"]
+
+    url = (
+        f"{CLOUD_URL}/api/{REST_API}"
+        f"/sites/{site_id}"
+        f"/datasources/{ds_id}"
+        f"/connections/{conn_id}"
+    )
+
+    xml = (
+        f'<tsRequest>'
+        f'<connection '
+        f'serverAddress="{escape(SNOWFLAKE_SERVER)}" '
+        f'authenticationType="auth-keypair" '
+        f'userName="{escape(SNOWFLAKE_USERNAME)}" '
+        f'embedPassword="true"/>'
+        f'</tsRequest>'
+    )
+
+    r = requests.put(
+        url,
+        headers=headers(
+            token,
+            "application/xml"
+        ),
+        data=xml.encode("utf-8"),
+        verify=VERIFY_SSL,
+        timeout=60
+    )
+
+    check(
+        r,
+        "Embed keypair user"
+    )
+
+    print(
+        "Connection updated:",
+        conn_id
+    )
+
+
+def verify(
+    token,
+    site_id,
+    ds_id
+):
+    connections = get_connections(
+        token,
+        site_id,
+        ds_id
+    )
+
+    targets = [
+        c
+        for c in connections
+        if is_snowflake(c)
+    ]
+
+    if not targets:
+        print(
+            "VERIFY FAILED: "
+            "No Snowflake connection"
+        )
+        return False
+
+    success = True
+
+    for conn in targets:
+
+        auth = conn.attrib.get(
+            "authenticationType"
+        )
+
+        user = conn.attrib.get(
+            "userName"
+        )
+
+        print(
+            "Auth:",
+            auth
+        )
+
+        print(
+            "User:",
+            user
+        )
+
+        if str(auth).casefold() != "auth-keypair":
+            success = False
+
+        if (
+            str(user).casefold()
+            != SNOWFLAKE_USERNAME.casefold()
+        ):
+            success = False
+
+    return success
+
+
+def main():
+    token = None
+
+    try:
+        print(
+            "Python:",
+            sys.version.split()[0]
+        )
+
+        token, site_id = sign_in()
+
+        project_id = get_project_id(
+            token,
+            site_id
+        )
+
+        for path in local_files():
+
+            print(
+                "\nProcessing:",
+                path
+            )
+
+            name, ds_id = publish(
+                token,
+                site_id,
+                project_id,
+                path
+            )
+
+            connections = get_connections(
+                token,
+                site_id,
+                ds_id
+            )
+
+            targets = [
+                c
+                for c in connections
+                if is_snowflake(c)
+            ]
+
+            if not targets:
+                raise RuntimeError(
+                    f"No Snowflake connection "
+                    f"found in {name}"
+                )
+
+            for conn in targets:
+                embed_keypair(
+                    token,
+                    site_id,
+                    ds_id,
+                    conn
+                )
+
+            result = verify(
+                token,
+                site_id,
+                ds_id
+            )
+
+            print(
+                "RESULT:",
+                "SUCCESS"
+                if result
+                else "VERIFY FAILED"
+            )
+
+    finally:
+        if token:
+            sign_out(token)
+
+
+if __name__ == "__main__":
+    main()
